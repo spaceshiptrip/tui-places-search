@@ -7,6 +7,7 @@ import math
 import sys
 import textwrap
 import webbrowser
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,12 +26,13 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.openstreetmap.fr/api/interpreter",
 ]
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-USER_AGENT = "places-tui/1.3 (personal use) https://openstreetmap.org"
+USER_AGENT = "places-tui/1.4 (personal use) https://openstreetmap.org"
+
+ZIP_RE = re.compile(r"^\s*(\d{5})(?:-\d{4})?\s*$")  # capture 5-digit ZIP
 
 # ---- Utils ----
 def haversine_miles(lat1, lon1, lat2, lon2):
-    """Great-circle distance in miles."""
-    R = 3958.7613  # mean Earth radius (miles)
+    R = 3958.7613  # miles
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlmb = math.radians(lon2 - lon1)
@@ -70,7 +72,6 @@ def simplify_variants(q: str) -> List[str]:
     return list(dict.fromkeys([q1, q2]))
 
 def bbox_from_center(lat: float, lon: float, radius_mi: float) -> Tuple[float,float,float,float]:
-    """Approximate bounding box for given miles radius."""
     km = radius_mi * 1.60934
     dlat = km / 111.32
     dlon = km / (111.32 * max(0.01, math.cos(math.radians(lat))))
@@ -120,11 +121,11 @@ class PlacesTUI(App):
             self.query_input = Input(id="query")
             yield self.query_input
 
-            yield Label("Near (e.g., Pasadena, CA):")
+            yield Label("Near (e.g., Pasadena, CA or 91101):")
             self.near_input = Input(id="near")
             yield self.near_input
 
-            yield Label("Radius mi (1–20):")
+            yield Label("Radius mi (0.1–20):")
             self.radius_input = Input(value="3", id="radius")
             yield self.radius_input
 
@@ -175,8 +176,7 @@ class PlacesTUI(App):
             self.call_from_thread(self.status.set, f"Geocoding failed: {e}")
             return
 
-        # Convert miles -> meters for Overpass
-        radius_m = radius_mi * 1609.34
+        radius_m = radius_mi * 1609.34  # miles -> meters
 
         results: List[Dict[str, Any]] = []
         try:
@@ -240,19 +240,23 @@ class PlacesTUI(App):
         self.status.set(f"Opened {p.name} in browser.")
 
     # ---- network helpers ----
-    def _geocode(self, near):
-        r = requests.get(
-            NOMINATIM_URL,
-            params={"format": "json", "q": near, "limit": 1},
-            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-            timeout=15,
-        )
+    def _geocode(self, near: str):
+        s = near.strip()
+        m = ZIP_RE.match(s)
+        if m:
+            zip5 = m.group(1)
+            params = {"format": "json", "q": zip5, "countrycodes": "us", "limit": 1, "addressdetails": 1}
+        else:
+            params = {"format": "json", "q": s, "limit": 1, "addressdetails": 1}
+        r = requests.get(NOMINATIM_URL, params=params,
+                         headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+                         timeout=15)
         r.raise_for_status()
         data = r.json()
         if not data:
             raise ValueError("No match for location.")
         d = data[0]
-        return float(d["lat"]), float(d["lon"]), d.get("display_name", near)
+        return float(d["lat"]), float(d["lon"]), d.get("display_name", s)
 
     def _overpass_search_all(self, query, lat, lon, radius_m) -> List[Dict[str, Any]]:
         variants = simplify_variants(query)
@@ -291,6 +295,7 @@ class PlacesTUI(App):
             "bounded": 1,
             "limit": 50,
             "addressdetails": 1,
+            "countrycodes": "us"  # gently bias when searching US ZIPs / cities
         }
         headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
         r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=20)
