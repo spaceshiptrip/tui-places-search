@@ -102,6 +102,11 @@ class PlacesTUI(App):
     BINDINGS = [
         Binding("enter", "search", "Search"),
         Binding("ctrl+s", "search", "Search Now"),
+        Binding("/", "focus_query", "Focus Query"),
+        Binding("j", "vi_down", show=False),
+        Binding("k", "vi_up", show=False),
+        Binding("g", "vi_top", show=False),
+        Binding("G", "vi_bottom", show=False),
         Binding("o", "open_map", "Open Map"),
         Binding("q", "quit", "Quit"),
     ]
@@ -143,6 +148,50 @@ class PlacesTUI(App):
     def on_mount(self):
         self.query_input.focus()
 
+    # ----- vi helpers -----
+    def _row_count(self) -> int:
+        return len(self.places)
+
+    def _current_row(self) -> int:
+        row = getattr(self.table, "cursor_row", None)
+        if row is None:
+            try:
+                row = self.table.cursor_coordinate[0]
+            except Exception:
+                row = 0
+        if self._row_count() == 0:
+            return 0
+        return max(0, min(row, self._row_count()-1))
+
+    def _set_row(self, row: int) -> None:
+        if self._row_count() == 0:
+            return
+        row = max(0, min(row, self._row_count()-1))
+        try:
+            if hasattr(self.table, "cursor_coordinate"):
+                self.table.cursor_coordinate = (row, 0)
+            elif hasattr(self.table, "move_cursor"):
+                self.table.move_cursor(row=row)
+        except Exception:
+            pass
+
+    # ----- vi actions -----
+    def action_vi_down(self) -> None:
+        self._set_row(self._current_row() + 1)
+
+    def action_vi_up(self) -> None:
+        self._set_row(self._current_row() - 1)
+
+    def action_vi_top(self) -> None:
+        self._set_row(0)
+
+    def action_vi_bottom(self) -> None:
+        self._set_row(self._row_count() - 1)
+
+    def action_focus_query(self) -> None:
+        self.query_input.focus()
+
+    # ----- existing UI events -----
     def on_button_pressed(self, event: Button.Pressed):
         if event.button is self.search_btn:
             self._sync_inputs_and_search()
@@ -212,7 +261,7 @@ class PlacesTUI(App):
             self.places = places[:100]
             self._render_table()
             msg = f"Found {len(self.places)} place(s) near {near}." if self.places else "No results."
-            self.status.set(msg + "  Use ↑/↓, press 'o' to open in map.")
+            self.status.set(msg + "  Use ↑/↓ (or j/k), g/G for top/bottom, 'o' to open.")
         self.call_from_thread(apply)
 
     def _render_table(self):
