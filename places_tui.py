@@ -9,10 +9,16 @@ import textwrap
 import webbrowser
 import re
 import time
+import os
+import json
+import sqlite3
+import zlib
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
+from threading import Lock
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -32,9 +38,68 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.openstreetmap.fr/api/interpreter",
 ]
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-USER_AGENT = "places-tui/1.7 (personal use) https://openstreetmap.org"
+USER_AGENT = "places-tui/1.8 (personal use) https://openstreetmap.org"
 
 ZIP_RE = re.compile(r"^\s*(\d{5})(?:-\d{4})?\s*$")  # capture 5-digit ZIP
+
+# ---- Cache settings ----
+CACHE_DIR = Path(os.path.expanduser("~/.places_tui"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_PATH = CACHE_DIR / "cache.db"
+
+GEOCODE_TTL_S = 14 * 24 * 3600     # 14 days
+OVERPASS_TTL_S = 1 * 24 * 3600     # 1 day
+
+_db_lock = Lock()
+_db_conn: Optional[sqlite3.Connection] = None
+
+def _db() -> sqlite3.Connection:
+    global _db_conn
+    if _db_conn is None:
+        _db_conn = sqlite3.connect(CACHE_PATH, check_same_thread=False)
+        _db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS kv (
+                k TEXT PRIMARY KEY,
+                v BLOB NOT NULL,
+                t INTEGER NOT NULL
+            )
+        """)
+        _db_conn.execute("PRAGMA journal_mode=WAL")
+        _db_conn.execute("PRAGMA synchronous=NORMAL")
+        _db_conn.commit()
+    return _db_conn
+
+def cache_get(key: str, max_age_s: int) -> Optional[bytes]:
+    now = int(time.time())
+    with _db_lock:
+        cur = _db().execute("SELECT v, t FROM kv WHERE k=? LIMIT 1", (key,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    v, t = row
+    if now - int(t) > max_age_s:
+        return None
+    return v
+
+def cache_set(key: str, raw_bytes: bytes) -> None:
+    now = int(time.time())
+    with _db_lock:
+        _db().execute("INSERT OR REPLACE INTO kv (k, v, t) VALUES (?, ?, ?)", (key, raw_bytes, now))
+        _db().commit()
+
+def cache_set_json(key: str, obj: Any) -> None:
+    data = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    cache_set(key, zlib.compress(data, level=6))
+
+def cache_get_json(key: str, max_age_s: int) -> Optional[Any]:
+    blob = cache_get(key, max_age_s)
+    if blob is None:
+        return None
+    try:
+        data = zlib.decompress(blob)
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
 
 # ---- HTTP session with keep-alive & retry ----
 def _make_session() -> requests.Session:
@@ -235,7 +300,7 @@ class PlacesTUI(App):
             self.call_from_thread(self.status.set, "Please enter both Query and Near location.")
             return
         try:
-            lat, lon, display_name = geocode_cached(near)
+            lat, lon, display_name = geocode_cached_disk_first(near)
         except Exception as e:
             self.call_from_thread(self.status.set, f"Geocoding failed: {e}")
             return
@@ -248,7 +313,7 @@ class PlacesTUI(App):
         # 1) Exact anchored brand/name (fast path)
         for r in radii_m:
             try:
-                results = self._overpass_exact_first(q, lat, lon, r, limit=80)
+                results = overpass_cached(self._overpass_exact_first, q, lat, lon, r, 80)
                 if results:
                     break
             except Exception:
@@ -258,7 +323,7 @@ class PlacesTUI(App):
         if len(results) < 8:
             for r in radii_m:
                 try:
-                    broadened = self._overpass_name_brand_regex(q, lat, lon, r, limit=120)
+                    broadened = overpass_cached(self._overpass_name_brand_regex, q, lat, lon, r, 120)
                     # merge without dupes
                     bykey = {(e.get("type",""), e.get("id")) for e in results if "id" in e}
                     for e in broadened:
@@ -270,10 +335,10 @@ class PlacesTUI(App):
                 except Exception:
                     pass
 
-        # 3) Nominatim bounded fallback only if we still have nothing
+        # 3) Nominatim bounded fallback only if we still have nothing (also cached)
         if not results:
             try:
-                results = self._nominatim_bounded(q, lat, lon, radius_mi)
+                results = nominatim_bounded_cached(q, lat, lon, radius_mi)
             except Exception:
                 results = []
 
@@ -346,7 +411,7 @@ class PlacesTUI(App):
                 f'relation(around:{radius_m},{lat},{lon})["operator"~{rx}];',
             ]
         ql = f"[out:json][timeout:20];({''.join(blocks)});out center tags {int(limit)};"
-        return call_overpass_parallel(ql)
+        return call_overpass_parallel_cached(ql)
 
     def _overpass_name_brand_regex(self, query, lat, lon, radius_m, limit=120) -> List[Dict[str, Any]]:
         """Broader but still lightweight: only `name` and `brand` regex (skip operator/cuisine to reduce work)."""
@@ -364,7 +429,7 @@ class PlacesTUI(App):
                 f'relation(around:{radius_m},{lat},{lon})["brand"~{rx}];',
             ]
         ql = f"[out:json][timeout:25];({''.join(blocks)});out center tags {int(limit)};"
-        return call_overpass_parallel(ql)
+        return call_overpass_parallel_cached(ql)
 
     def _nominatim_bounded(self, query: str, lat: float, lon: float, radius_mi: float) -> List[Dict[str, Any]]:
         left, bottom, right, top = bbox_from_center(lat, lon, radius_mi)
@@ -398,7 +463,22 @@ class PlacesTUI(App):
 
 # ---- shared helpers (module level so we can cache them) ----
 @lru_cache(maxsize=256)
-def geocode_cached(near: str) -> Tuple[float, float, str]:
+def geocode_cached_mem(near: str) -> Tuple[float, float, str]:
+    """In-memory small LRU (still used after disk cache to avoid JSON decode repeatedly)."""
+    return _geocode_network(near)
+
+def geocode_cached_disk_first(near: str) -> Tuple[float, float, str]:
+    """Disk-first cache for geocoding."""
+    key = f"geo:{near.strip().lower()}"
+    hit = cache_get_json(key, GEOCODE_TTL_S)
+    if hit and isinstance(hit, dict) and {"lat","lon","name"} <= hit.keys():
+        return float(hit["lat"]), float(hit["lon"]), str(hit["name"])
+    # Miss → network (via small LRU helper), then store
+    lat, lon, name = geocode_cached_mem(near)
+    cache_set_json(key, {"lat": lat, "lon": lon, "name": name})
+    return lat, lon, name
+
+def _geocode_network(near: str) -> Tuple[float, float, str]:
     s = near.strip()
     m = ZIP_RE.match(s)
     if m:
@@ -428,6 +508,64 @@ def call_overpass_parallel(ql: str) -> List[Dict[str, Any]]:
             except Exception:
                 continue
     return []
+
+def call_overpass_parallel_cached(ql: str) -> List[Dict[str, Any]]:
+    """Same as above, but with a disk cache keyed by the full Overpass QL."""
+    key = "ovp:" + str(hash(ql))  # compact key, hash is fine (collisions practically negligible here)
+    hit = cache_get_json(key, OVERPASS_TTL_S)
+    if hit is not None and isinstance(hit, list):
+        return hit
+    elems = call_overpass_parallel(ql)
+    cache_set_json(key, elems)
+    return elems
+
+def overpass_cached(fn, q: str, lat: float, lon: float, radius_m: int, limit: int) -> List[Dict[str, Any]]:
+    """Cache wrapper for the two Overpass builders (exact / name-brand regex)."""
+    # key must capture query + parameters + which function (different QL)
+    sig = f"{fn.__name__}|{q}|{lat:.6f}|{lon:.6f}|{radius_m}|{limit}"
+    key = "ovp:" + str(hash(sig))
+    hit = cache_get_json(key, OVERPASS_TTL_S)
+    if hit is not None and isinstance(hit, list):
+        return hit
+    elems = fn(q, lat, lon, radius_m, limit)  # will itself call call_overpass_parallel_cached
+    cache_set_json(key, elems)
+    return elems
+
+def nominatim_bounded_cached(query: str, lat: float, lon: float, radius_mi: float) -> List[Dict[str, Any]]:
+    sig = f"nomi:{query}|{lat:.6f}|{lon:.6f}|{radius_mi:.3f}"
+    hit = cache_get_json(sig, OVERPASS_TTL_S)
+    if hit is not None and isinstance(hit, list):
+        return hit
+    # network
+    left, bottom, right, top = bbox_from_center(lat, lon, radius_mi)
+    params = {
+        "format": "json",
+        "q": query,
+        "viewbox": f"{left},{top},{right},{bottom}",
+        "bounded": 1,
+        "limit": 40,
+        "addressdetails": 1,
+        "countrycodes": "us"
+    }
+    r = SESSION.get(NOMINATIM_URL, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    out = []
+    for d in data:
+        try:
+            plat, plon = float(d["lat"]), float(d["lon"])
+        except Exception:
+            continue
+        out.append({
+            "display_name": d.get("display_name", "(unnamed)"),
+            "lat": plat,
+            "lon": plon,
+            "address": d.get("display_name", ""),
+            "tags": {},
+            "latlon": (plat, plon),
+        })
+    cache_set_json(sig, out)
+    return out
 
 if __name__ == "__main__":
     try:
