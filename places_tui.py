@@ -8,10 +8,16 @@ import sys
 import textwrap
 import webbrowser
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, Horizontal
@@ -26,9 +32,25 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.openstreetmap.fr/api/interpreter",
 ]
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-USER_AGENT = "places-tui/1.4 (personal use) https://openstreetmap.org"
+USER_AGENT = "places-tui/1.7 (personal use) https://openstreetmap.org"
 
 ZIP_RE = re.compile(r"^\s*(\d{5})(?:-\d{4})?\s*$")  # capture 5-digit ZIP
+
+# ---- HTTP session with keep-alive & retry ----
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
+    retry = Retry(
+        total=2, connect=2, read=2, backoff_factor=0.3,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET","POST"])
+    )
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+SESSION = _make_session()
 
 # ---- Utils ----
 def haversine_miles(lat1, lon1, lat2, lon2):
@@ -69,7 +91,9 @@ def escape_for_overpass_regex(s: str) -> str:
 def simplify_variants(q: str) -> List[str]:
     q1 = q.replace("’", "'").strip()
     q2 = q1.replace("'", "")
-    return list(dict.fromkeys([q1, q2]))
+    # also collapse multiple spaces
+    q3 = re.sub(r"\s+", " ", q1)
+    return list(dict.fromkeys([q3, q2]))
 
 def bbox_from_center(lat: float, lon: float, radius_mi: float) -> Tuple[float,float,float,float]:
     km = radius_mi * 1.60934
@@ -148,7 +172,7 @@ class PlacesTUI(App):
     def on_mount(self):
         self.query_input.focus()
 
-    # ----- vi helpers -----
+    # vi helpers
     def _row_count(self) -> int:
         return len(self.places)
 
@@ -175,23 +199,14 @@ class PlacesTUI(App):
         except Exception:
             pass
 
-    # ----- vi actions -----
-    def action_vi_down(self) -> None:
-        self._set_row(self._current_row() + 1)
+    # vi actions
+    def action_vi_down(self) -> None: self._set_row(self._current_row() + 1)
+    def action_vi_up(self) -> None: self._set_row(self._current_row() - 1)
+    def action_vi_top(self) -> None: self._set_row(0)
+    def action_vi_bottom(self) -> None: self._set_row(self._row_count() - 1)
+    def action_focus_query(self) -> None: self.query_input.focus()
 
-    def action_vi_up(self) -> None:
-        self._set_row(self._current_row() - 1)
-
-    def action_vi_top(self) -> None:
-        self._set_row(0)
-
-    def action_vi_bottom(self) -> None:
-        self._set_row(self._row_count() - 1)
-
-    def action_focus_query(self) -> None:
-        self.query_input.focus()
-
-    # ----- existing UI events -----
+    # events
     def on_button_pressed(self, event: Button.Pressed):
         if event.button is self.search_btn:
             self._sync_inputs_and_search()
@@ -220,24 +235,46 @@ class PlacesTUI(App):
             self.call_from_thread(self.status.set, "Please enter both Query and Near location.")
             return
         try:
-            lat, lon, display_name = self._geocode(near)
+            lat, lon, display_name = geocode_cached(near)
         except Exception as e:
             self.call_from_thread(self.status.set, f"Geocoding failed: {e}")
             return
 
-        radius_m = radius_mi * 1609.34  # miles -> meters
+        # Progressive radius: start smaller, then expand if needed
+        r_small = max(0.25, min(radius_mi, radius_mi * 0.5))
+        radii_m = [int(r_small * 1609.34), int(radius_mi * 1609.34)]
 
         results: List[Dict[str, Any]] = []
-        try:
-            results = self._overpass_search_all(q, lat, lon, int(radius_m))
-        except Exception as e:
-            self.call_from_thread(self.status.set, f"Overpass issue, trying fallback… ({e})")
+        # 1) Exact anchored brand/name (fast path)
+        for r in radii_m:
+            try:
+                results = self._overpass_exact_first(q, lat, lon, r, limit=80)
+                if results:
+                    break
+            except Exception:
+                pass
 
+        # 2) If still few results, broaden to lightweight regex over name/brand only
+        if len(results) < 8:
+            for r in radii_m:
+                try:
+                    broadened = self._overpass_name_brand_regex(q, lat, lon, r, limit=120)
+                    # merge without dupes
+                    bykey = {(e.get("type",""), e.get("id")) for e in results if "id" in e}
+                    for e in broadened:
+                        k = (e.get("type",""), e.get("id"))
+                        if "id" in e and k not in bykey:
+                            results.append(e); bykey.add(k)
+                    if len(results) >= 8:
+                        break
+                except Exception:
+                    pass
+
+        # 3) Nominatim bounded fallback only if we still have nothing
         if not results:
             try:
                 results = self._nominatim_bounded(q, lat, lon, radius_mi)
-            except Exception as e:
-                self.call_from_thread(self.status.set, f"Fallback failed: {e}")
+            except Exception:
                 results = []
 
         places: List[Place] = []
@@ -257,6 +294,7 @@ class PlacesTUI(App):
             places.append(Place(name, addr, plat, plon, dist, o))
 
         places.sort(key=lambda p: p.distance_mi)
+
         def apply():
             self.places = places[:100]
             self._render_table()
@@ -289,51 +327,44 @@ class PlacesTUI(App):
         self.status.set(f"Opened {p.name} in browser.")
 
     # ---- network helpers ----
-    def _geocode(self, near: str):
-        s = near.strip()
-        m = ZIP_RE.match(s)
-        if m:
-            zip5 = m.group(1)
-            params = {"format": "json", "q": zip5, "countrycodes": "us", "limit": 1, "addressdetails": 1}
-        else:
-            params = {"format": "json", "q": s, "limit": 1, "addressdetails": 1}
-        r = requests.get(NOMINATIM_URL, params=params,
-                         headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-                         timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            raise ValueError("No match for location.")
-        d = data[0]
-        return float(d["lat"]), float(d["lon"]), d.get("display_name", s)
-
-    def _overpass_search_all(self, query, lat, lon, radius_m) -> List[Dict[str, Any]]:
+    def _overpass_exact_first(self, query, lat, lon, radius_m, limit=80) -> List[Dict[str, Any]]:
+        """Try exact brand/name/oper match with anchored regex (fast + low cardinality)."""
         variants = simplify_variants(query)
         blocks: List[str] = []
         for qv in variants:
             q = escape_for_overpass_regex(qv)
+            rx = f'"^{q}$",i'   # exact, case-insensitive
             blocks += [
-                f'node(around:{radius_m},{lat},{lon})["name"~"{q}",i];',
-                f'way(around:{radius_m},{lat},{lon})["name"~"{q}",i];',
-                f'relation(around:{radius_m},{lat},{lon})["name"~"{q}",i];',
-                f'node(around:{radius_m},{lat},{lon})["brand"~"{q}",i];',
-                f'way(around:{radius_m},{lat},{lon})["brand"~"{q}",i];',
-                f'relation(around:{radius_m},{lat},{lon})["brand"~"{q}",i];',
+                f'node(around:{radius_m},{lat},{lon})["name"~{rx}];',
+                f'way(around:{radius_m},{lat},{lon})["name"~{rx}];',
+                f'relation(around:{radius_m},{lat},{lon})["name"~{rx}];',
+                f'node(around:{radius_m},{lat},{lon})["brand"~{rx}];',
+                f'way(around:{radius_m},{lat},{lon})["brand"~{rx}];',
+                f'relation(around:{radius_m},{lat},{lon})["brand"~{rx}];',
+                f'node(around:{radius_m},{lat},{lon})["operator"~{rx}];',
+                f'way(around:{radius_m},{lat},{lon})["operator"~{rx}];',
+                f'relation(around:{radius_m},{lat},{lon})["operator"~{rx}];',
             ]
-        ql = f"[out:json][timeout:25];({''.join(blocks)});out center tags;"
-        elems = self._call_overpass(ql)
-        return elems or []
+        ql = f"[out:json][timeout:20];({''.join(blocks)});out center tags {int(limit)};"
+        return call_overpass_parallel(ql)
 
-    def _call_overpass(self, ql: str) -> List[Dict[str, Any]]:
-        headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-        for url in OVERPASS_ENDPOINTS:
-            try:
-                resp = requests.post(url, data={"data": ql}, headers=headers, timeout=60)
-                resp.raise_for_status()
-                return resp.json().get("elements", [])
-            except requests.RequestException:
-                continue
-        return []
+    def _overpass_name_brand_regex(self, query, lat, lon, radius_m, limit=120) -> List[Dict[str, Any]]:
+        """Broader but still lightweight: only `name` and `brand` regex (skip operator/cuisine to reduce work)."""
+        variants = simplify_variants(query)
+        blocks: List[str] = []
+        for qv in variants:
+            q = escape_for_overpass_regex(qv)
+            rx = f'"{q}",i'
+            blocks += [
+                f'node(around:{radius_m},{lat},{lon})["name"~{rx}];',
+                f'way(around:{radius_m},{lat},{lon})["name"~{rx}];',
+                f'relation(around:{radius_m},{lat},{lon})["name"~{rx}];',
+                f'node(around:{radius_m},{lat},{lon})["brand"~{rx}];',
+                f'way(around:{radius_m},{lat},{lon})["brand"~{rx}];',
+                f'relation(around:{radius_m},{lat},{lon})["brand"~{rx}];',
+            ]
+        ql = f"[out:json][timeout:25];({''.join(blocks)});out center tags {int(limit)};"
+        return call_overpass_parallel(ql)
 
     def _nominatim_bounded(self, query: str, lat: float, lon: float, radius_mi: float) -> List[Dict[str, Any]]:
         left, bottom, right, top = bbox_from_center(lat, lon, radius_mi)
@@ -342,12 +373,11 @@ class PlacesTUI(App):
             "q": query,
             "viewbox": f"{left},{top},{right},{bottom}",
             "bounded": 1,
-            "limit": 50,
+            "limit": 40,
             "addressdetails": 1,
-            "countrycodes": "us"  # gently bias when searching US ZIPs / cities
+            "countrycodes": "us"
         }
-        headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-        r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=20)
+        r = SESSION.get(NOMINATIM_URL, params=params, timeout=15)
         r.raise_for_status()
         data = r.json()
         out = []
@@ -365,6 +395,39 @@ class PlacesTUI(App):
                 "latlon": (plat, plon),
             })
         return out
+
+# ---- shared helpers (module level so we can cache them) ----
+@lru_cache(maxsize=256)
+def geocode_cached(near: str) -> Tuple[float, float, str]:
+    s = near.strip()
+    m = ZIP_RE.match(s)
+    if m:
+        zip5 = m.group(1)
+        params = {"format": "json", "q": zip5, "countrycodes": "us", "limit": 1, "addressdetails": 1}
+    else:
+        params = {"format": "json", "q": s, "limit": 1, "addressdetails": 1}
+    r = SESSION.get(NOMINATIM_URL, params=params, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        raise ValueError("No match for location.")
+    d = data[0]
+    return float(d["lat"]), float(d["lon"]), d.get("display_name", s)
+
+def call_overpass_parallel(ql: str) -> List[Dict[str, Any]]:
+    """POST the same query to multiple Overpass mirrors **in parallel**; return the first success."""
+    def post(url: str):
+        resp = SESSION.post(url, data={"data": ql}, timeout=20)
+        resp.raise_for_status()
+        return resp.json().get("elements", [])
+    with ThreadPoolExecutor(max_workers=min(3, len(OVERPASS_ENDPOINTS))) as ex:
+        futures = {ex.submit(post, url): url for url in OVERPASS_ENDPOINTS}
+        for fut in as_completed(futures):
+            try:
+                return fut.result()
+            except Exception:
+                continue
+    return []
 
 if __name__ == "__main__":
     try:
