@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-from threading import Lock, Event
+from threading import Lock, Event, Thread
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -28,7 +28,7 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.openstreetmap.fr/api/interpreter",
 ]
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-USER_AGENT = "places-tui/2.0 (personal use) https://openstreetmap.org"
+USER_AGENT = "places-tui/2.1 (personal use) https://openstreetmap.org"
 ZIP_RE = re.compile(r"^\s*(\d{5})(?:-\d{4})?\s*$")
 
 # ---------------- Cache (SQLite) ----------------
@@ -37,6 +37,12 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_PATH = CACHE_DIR / "cache.db"
 GEOCODE_TTL_S  = 14 * 24 * 3600
 OVERPASS_TTL_S =  1 * 24 * 3600
+
+# SWR windows (serve stale immediately, refresh in background)
+OVERPASS_SOFT_S = 15 * 60     # 15 minutes
+OVERPASS_HARD_S = 24 * 3600   # 24 hours
+GEOCODE_SOFT_S  =  7 * 24 * 3600
+GEOCODE_HARD_S  = 30 * 24 * 3600
 
 _db_lock = Lock()
 _db_conn: Optional[sqlite3.Connection] = None
@@ -69,6 +75,55 @@ def cache_get_json(key: str, max_age_s: int) -> Optional[Any]:
 def cache_set_json(key: str, obj: Any) -> None:
     cache_set(key, zlib.compress(json.dumps(obj, separators=(",",":")).encode("utf-8"), 6))
 
+# Peek + SWR helpers
+def cache_peek_json(key: str) -> tuple[Optional[Any], Optional[int]]:
+    with _db_lock:
+        row = _db().execute("SELECT v,t FROM kv WHERE k=? LIMIT 1", (key,)).fetchone()
+    if not row: return None, None
+    v, t = row
+    try:
+        obj = json.loads(zlib.decompress(v).decode("utf-8"))
+    except Exception:
+        return None, None
+    age = int(time.time()) - int(t)
+    return obj, max(0, age)
+
+def swr_json(key: str, soft_ttl_s: int, hard_ttl_s: int, fetch_fn, on_update=None):
+    """Return cached data immediately if available; refresh in background when stale."""
+    cached, age = cache_peek_json(key)
+
+    def do_refresh_async():
+        try:
+            fresh = fetch_fn()
+            cache_set_json(key, fresh)
+            if on_update and fresh:
+                on_update(fresh)
+        except Exception:
+            pass
+
+    # no cache
+    if cached is None:
+        fresh = fetch_fn()
+        cache_set_json(key, fresh)
+        return fresh
+
+    # young enough
+    if age is None or age <= soft_ttl_s:
+        return cached
+
+    # stale but not too old
+    if age <= hard_ttl_s:
+        Thread(target=do_refresh_async, daemon=True).start()
+        return cached
+
+    # too old -> try sync refresh
+    try:
+        fresh = fetch_fn()
+        cache_set_json(key, fresh)
+        return fresh
+    except Exception:
+        return cached
+
 # ---------------- HTTP session ----------------
 def _make_session() -> requests.Session:
     s = requests.Session()
@@ -88,16 +143,43 @@ def haversine_miles(a,b,c,d):
     x=math.sin(dphi/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
     return R*(2*math.asin(math.sqrt(x)))
 def fmt_miles(x): return f"{x:.2f} mi" if x<10 else f"{x:.1f} mi"
-def make_address(tags):
-    parts=[]; hn=tags.get("addr:housenumber"); st=tags.get("addr:street")
-    if hn: parts.append(hn)
-    if st: parts[-1]=f"{parts[-1]} {st}" if parts else st
+
+def build_full_address(tags: Dict[str, str], raw: Optional[Dict[str, Any]] = None) -> str:
+    """Prefer addr:* composition; else addr:full; else raw display_name; never fall back to 'name'."""
+    parts: List[str] = []
+    hn = tags.get("addr:housenumber")
+    st = tags.get("addr:street")
+    if st and hn:
+        parts.append(f"{hn} {st}")
+    elif st:
+        parts.append(st)
+    elif hn:
+        parts.append(hn)
+
     city = tags.get("addr:city") or tags.get("addr:town") or tags.get("addr:village")
-    state=tags.get("addr:state"); pc=tags.get("addr:postcode")
-    tail=", ".join([p for p in [city,state] if p]);
+    state = tags.get("addr:state")
+    pc = tags.get("addr:postcode")
+    tail = ", ".join([p for p in (city, state) if p])
     if tail: parts.append(tail)
     if pc: parts.append(pc)
-    return ", ".join(parts) if parts else tags.get("name","(no address)")
+
+    if parts:
+        return ", ".join(parts)
+
+    # try addr:full
+    af = tags.get("addr:full")
+    if af:
+        return af
+
+    # fall back to raw display_name/address (from Nominatim or prior stage)
+    if raw:
+        if raw.get("address"):
+            return str(raw["address"])
+        if raw.get("display_name"):
+            return str(raw["display_name"])
+
+    return "(no address)"
+
 def pick_name(tags):
     for k in ("name","brand","operator"):
         if tags.get(k): return tags[k]
@@ -212,11 +294,11 @@ class PlacesTUI(App):
         except ValueError: v=3
         self.radius_mi = v
         self.table.clear(); self.places = []
-        self.status.set("Searching (streaming results)…  Press Esc or ‘Cancel’ to stop.")
+        self.status.set("Searching (streaming & SWR)…  Press Esc or ‘Cancel’ to stop.")
         self._cancel_evt = Event()
         self._do_search_stream(self.query_text.strip(), self.near_text.strip(), self.radius_mi, self._cancel_evt)
 
-    # ---------------- STREAMED SEARCH ----------------
+    # ---------------- STREAMED SEARCH (with SWR) ----------------
     @work(exclusive=True, thread=True)
     def _do_search_stream(self, q: str, near: str, radius_mi: float, cancel_evt: Event):
         if not q or not near:
@@ -243,7 +325,7 @@ class PlacesTUI(App):
                 elif "center" in o: plat,plon=float(o["center"]["lat"]),float(o["center"]["lon"])
                 elif "latlon" in o: plat,plon=o["latlon"]
                 else: continue
-                addr = make_address(tags) if tags else o.get("address","(no address)")
+                addr = build_full_address(tags, o)
                 dist = haversine_miles(lat, lon, plat, plon)
                 new_places.append(Place(name, addr, plat, plon, dist, o))
             if not new_places: return
@@ -261,19 +343,27 @@ class PlacesTUI(App):
                     except Exception: pass
             self.call_from_thread(apply_rows)
 
-        # PHASES (each with short timeouts & early exits). Update after each:
-        phases = []
-        def exact_blocks(k):  # k: object type
-            variants = simplify_variants(q); blocks=[]
-            for qv in variants:
+        # PHASES (each with short timeouts & early exits) -------------------
+        phases: List[Tuple[str, List[str], int]] = []
+
+        # Cuisine-first when generic (pho, pizza, sushi, etc.)
+        if is_generic_food_query(q):
+            for R in radii_m:
+                phases.append(("Cuisine nodes", build_cuisine_blocks("node", q), R))
+            for R in radii_m:
+                phases.append(("Cuisine ways/relations", build_cuisine_blocks("way", q) + build_cuisine_blocks("relation", q), R))
+
+        def exact_blocks(k):  # k: node/way/relation
+            blocks=[]
+            for qv in simplify_variants(q):
                 rx=f'"^{escape_for_overpass_regex(qv)}$",i'
                 blocks += [f'{k}(around:{{R}},{{lat}},{{lon}})["name"~{rx}];',
                            f'{k}(around:{{R}},{{lat}},{{lon}})["brand"~{rx}];',
                            f'{k}(around:{{R}},{{lat}},{{lon}})["operator"~{rx}];']
             return blocks
         def regex_blocks(k):
-            variants = simplify_variants(q); blocks=[]
-            for qv in variants:
+            blocks=[]
+            for qv in simplify_variants(q):
                 rx=f'"{escape_for_overpass_regex(qv)}",i'
                 blocks += [f'{k}(around:{{R}},{{lat}},{{lon}})["name"~{rx}];',
                            f'{k}(around:{{R}},{{lat}},{{lon}})["brand"~{rx}];']
@@ -288,20 +378,37 @@ class PlacesTUI(App):
         for R in radii_m:
             phases.append(("Regex ways/relations", regex_blocks("way")+regex_blocks("relation"), R))
 
-        # Run phases
+        # Run phases; stream each block; use SWR so cached rows appear instantly and background refresh updates UI.
         for title, blocks, R in phases:
-            if cancel_evt.is_set(): break
+            if cancel_evt.is_set():
+                break
             self.call_from_thread(self.status.set, f"{title} (R≈{int(R/1609.34)}mi)…")
-            ql = f"[out:json][timeout:15];(" + "".join(b.format(R=R, lat=lat, lon=lon) for b in blocks) + ");out center tags 120;"
-            elems = call_overpass_parallel_cached(ql, cancel_evt=cancel_evt, per_req_timeout=15)
-            if elems: push(elems)
+            for b in blocks:
+                if cancel_evt.is_set():
+                    break
+                ql = f"[out:json][timeout:12];({b.format(R=R, lat=lat, lon=lon)});out center tags 80;"
+                key = "ovp:" + str(hash(ql))
+                def _on_update(fresh):
+                    if cancel_evt.is_set(): return
+                    push(fresh)
+                elems = swr_json(
+                    key=key,
+                    soft_ttl_s=OVERPASS_SOFT_S,
+                    hard_ttl_s=OVERPASS_HARD_S,
+                    fetch_fn=lambda ql=ql: call_overpass_parallel(ql, per_req_timeout=12),
+                    on_update=_on_update
+                )
+                if elems:
+                    push(elems)
 
         # Fallback Nominatim (bounded)
-        if not cancel_evt.is_set() and len(self.places)==0:
+        if not cancel_evt.is_set() and len(self.places) == 0:
             self.call_from_thread(self.status.set, "Nominatim fallback…")
             try:
-                push(nominatim_bounded_cached(q, lat, lon, radius_mi))
-            except Exception: pass
+                nomi_q = f"{q} restaurant" if is_generic_food_query(q) and "restaurant" not in q.lower() else q
+                push(nominatim_bounded_cached(nomi_q, lat, lon, radius_mi))
+            except Exception:
+                pass
 
         if not cancel_evt.is_set():
             self.call_from_thread(self.status.set, f"Done. Found {len(self.places)} place(s). Press 'o' to open.")
@@ -316,11 +423,9 @@ class PlacesTUI(App):
         except Exception as e:
             self.status.set(f"Geocoding failed: {e}"); return
         self.status.set("Warming cache around Near (3 mi)…")
-        # You can edit this list to your liking:
-        topics = ["coffee shop","restaurant","fast food","supermarket","pharmacy","gas station","bakery","cafe","bar"]
+        topics = ["coffee shop","restaurant","fast food","supermarket","pharmacy","gas station","bakery","cafe","bar","pho","vietnamese","sushi","pizza"]
         for topic in topics:
             try:
-                # small, quick node-only regex at 3 miles
                 R = int(3 * 1609.34)
                 variants = simplify_variants(topic); blocks=[]
                 for qv in variants:
@@ -328,7 +433,15 @@ class PlacesTUI(App):
                     blocks += [f'node(around:{R},{lat},{lon})["name"~{rx}];',
                                f'node(around:{R},{lat},{lon})["brand"~{rx}];']
                 ql = f"[out:json][timeout:12];(" + "".join(blocks) + ");out center tags 80;"
-                _ = call_overpass_parallel_cached(ql, cancel_evt=None, per_req_timeout=12)
+                key = "ovp:" + str(hash(ql))
+                # Warm via SWR fetcher (force a network fetch if missing/old)
+                _ = swr_json(
+                    key=key,
+                    soft_ttl_s=OVERPASS_SOFT_S,
+                    hard_ttl_s=OVERPASS_HARD_S,
+                    fetch_fn=lambda ql=ql: call_overpass_parallel(ql, per_req_timeout=12),
+                    on_update=None
+                )
             except Exception:
                 continue
         self.status.set("Cache warmed for common categories near your location.")
@@ -359,11 +472,11 @@ def geocode_cached_mem(near: str) -> Tuple[float,float,str]:
 
 def geocode_cached_disk_first(near: str) -> Tuple[float,float,str]:
     key=f"geo:{near.strip().lower()}"
-    hit=cache_get_json(key, GEOCODE_TTL_S)
-    if hit and {"lat","lon","name"}<=hit.keys():
-        return float(hit["lat"]), float(hit["lon"]), str(hit["name"])
-    lat,lon,name=geocode_cached_mem(near)
-    cache_set_json(key, {"lat":lat,"lon":lon,"name":name}); return lat,lon,name
+    def fetcher():
+        lat,lon,name=_geocode_network(near)
+        return {"lat":lat,"lon":lon,"name":name}
+    obj = swr_json(key, GEOCODE_SOFT_S, GEOCODE_HARD_S, fetcher, on_update=None)
+    return float(obj["lat"]), float(obj["lon"]), str(obj["name"])
 
 def _geocode_network(near: str) -> Tuple[float,float,str]:
     s=near.strip(); m=ZIP_RE.match(s)
@@ -386,13 +499,12 @@ def call_overpass_parallel(ql: str, per_req_timeout: int = 15) -> List[Dict[str,
     return []
 
 def call_overpass_parallel_cached(ql: str, cancel_evt: Optional[Event], per_req_timeout: int = 15) -> List[Dict[str,Any]]:
+    """Kept for compatibility; now delegates to SWR."""
     key="ovp:"+str(hash(ql))
-    hit=cache_get_json(key, OVERPASS_TTL_S)
-    if isinstance(hit,list): return hit
-    if cancel_evt and cancel_evt.is_set(): return []
-    elems=call_overpass_parallel(ql, per_req_timeout=per_req_timeout)
-    if cancel_evt and cancel_evt.is_set(): return []
-    cache_set_json(key, elems); return elems
+    def fetcher():
+        if cancel_evt and cancel_evt.is_set(): return []
+        return call_overpass_parallel(ql, per_req_timeout=per_req_timeout)
+    return swr_json(key, OVERPASS_SOFT_S, OVERPASS_HARD_S, fetcher, on_update=None)
 
 def nominatim_bounded_cached(query: str, lat: float, lon: float, radius_mi: float) -> List[Dict[str,Any]]:
     sig=f"nomi:{query}|{lat:.6f}|{lon:.6f}|{radius_mi:.3f}"
@@ -407,6 +519,35 @@ def nominatim_bounded_cached(query: str, lat: float, lon: float, radius_mi: floa
         except Exception: continue
         out.append({"display_name":d.get("display_name","(unnamed)"),"lat":plat,"lon":plon,"address":d.get("display_name",""),"tags":{},"latlon":(plat,plon)})
     cache_set_json(sig,out); return out
+
+# Generic-ish food queries that should use cuisine/category fast-path
+GENERIC_TERMS = {
+    "pho","vietnamese","ramen","sushi","pizza","tacos","taco","burger","bbq",
+    "bar","pub","cafe","coffee","bakery","donuts","boba","dim sum","noodles",
+    "kebab","korean","thai","indian","mexican","ethiopian","lebanese","falafel",
+    "shawarma","hotpot","dumpling","poke","sandwich","bagel","steak","seafood",
+    "breakfast","brunch","diner","halal","kosher"
+}
+def is_generic_food_query(q: str) -> bool:
+    s = q.strip().lower()
+    return s in GENERIC_TERMS or (len(s.split()) == 1 and s in GENERIC_TERMS)
+
+def cuisine_regex_for(q: str) -> str:
+    s = q.strip().lower()
+    if s == "pho":
+        return r'"(?i)(^|;|\s)(pho|vietnamese)(;|\s|$)"'
+    esc = escape_for_overpass_regex(s)
+    return fr'"(?i)(^|;|\s){esc}(;|\s|$)"'
+
+def build_cuisine_blocks(obj_type: str, q: str) -> List[str]:
+    rx_cui = cuisine_regex_for(q)
+    rx_nm  = f'"{escape_for_overpass_regex(q)}",i'
+    return [
+        f'{obj_type}(around:{{R}},{{lat}},{{lon}})["amenity"="restaurant"]["cuisine"~{rx_cui}];',
+        f'{obj_type}(around:{{R}},{{lat}},{{lon}})["amenity"="fast_food"]["cuisine"~{rx_cui}];',
+        f'{obj_type}(around:{{R}},{{lat}},{{lon}})["name"~{rx_nm}];',
+        f'{obj_type}(around:{{R}},{{lat}},{{lon}})["brand"~{rx_nm}];',
+    ]
 
 # ---------------- Exact/Regex builders (used in phases) ----------------
 def _blocks_exact(k: str, q: str) -> List[str]:
@@ -425,6 +566,7 @@ def _blocks_regex(k: str, q: str) -> List[str]:
                    f'{k}(around:{{R}},{{lat}},{{lon}})["brand"~{rx}];']
     return blocks
 
+# ---------------- Entrypoint ----------------
 def main():
     import argparse, os, traceback
 
