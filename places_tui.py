@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
-import math, sys, webbrowser, re, time, os, json, sqlite3, zlib
+import math, sys, webbrowser, re, time, os, json, sqlite3, zlib, platform, subprocess, shutil
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,7 +28,7 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.openstreetmap.fr/api/interpreter",
 ]
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-USER_AGENT = "places-tui/2.1 (personal use) https://openstreetmap.org"
+USER_AGENT = "places-tui/2.2 (personal use) https://openstreetmap.org"
 ZIP_RE = re.compile(r"^\s*(\d{5})(?:-\d{4})?\s*$")
 
 # ---------------- Cache (SQLite) ----------------
@@ -166,12 +166,10 @@ def build_full_address(tags: Dict[str, str], raw: Optional[Dict[str, Any]] = Non
     if parts:
         return ", ".join(parts)
 
-    # try addr:full
     af = tags.get("addr:full")
     if af:
         return af
 
-    # fall back to raw display_name/address (from Nominatim or prior stage)
     if raw:
         if raw.get("address"):
             return str(raw["address"])
@@ -196,6 +194,38 @@ def bbox_from_center(lat,lon,rad_mi):
     km=rad_mi*1.60934; dlat=km/111.32; dlon=km/(111.32*max(0.01,math.cos(math.radians(lat))))
     return (lon-dlon, lat-dlat, lon+dlon, lat+dlat)
 
+# ---- Clipboard helper (no extra deps; tries pyperclip if present) ----
+def _copy_to_clipboard(text: str) -> bool:
+    try:
+        import pyperclip  # optional
+        pyperclip.copy(text)
+        return True
+    except Exception:
+        pass
+    sysname = platform.system()
+    try:
+        if sysname == "Darwin" and shutil.which("pbcopy"):
+            p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            return p.returncode == 0
+        elif sysname == "Windows":
+            p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=True)
+            p.communicate(text.encode("utf-8"))
+            return p.returncode == 0
+        else:
+            # Linux/BSD: try wl-copy then xclip
+            if shutil.which("wl-copy"):
+                p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+                p.communicate(text.encode("utf-8"))
+                return p.returncode == 0
+            if shutil.which("xclip"):
+                p = subprocess.Popen(["xclip","-selection","clipboard"], stdin=subprocess.PIPE)
+                p.communicate(text.encode("utf-8"))
+                return p.returncode == 0
+    except Exception:
+        return False
+    return False
+
 @dataclass
 class Place:
     name: str; address: str; lat: float; lon: float; distance_mi: float; raw: Dict[str,Any]
@@ -217,7 +247,10 @@ class PlacesTUI(App):
         Binding("/", "focus_query", "Focus Query"),
         Binding("j", "vi_down", show=False), Binding("k", "vi_up", show=False),
         Binding("g", "vi_top", show=False),  Binding("G", "vi_bottom", show=False),
-        Binding("o", "open_map", "Open Map"), Binding("q", "quit", "Quit"),
+        Binding("o", "open_map", "Open Map"),
+        Binding("y", "yank_address", "Copy Address"),
+        Binding("Y", "yank_rich", "Copy Name+Addr+Coords"),
+        Binding("q", "quit", "Quit"),
         Binding("esc", "cancel_search", "Cancel"),
     ]
     query_text = reactive(""); near_text = reactive(""); radius_mi = reactive(3.0)
@@ -269,6 +302,22 @@ class PlacesTUI(App):
     def action_vi_top(self)->None:  self._set_row(0)
     def action_vi_bottom(self)->None: self._set_row(self._row_count()-1)
     def action_focus_query(self)->None: self.query_input.focus()
+
+    # yank/copy
+    def action_yank_address(self) -> None:
+        idx = self._current_row()
+        if not self.places: return
+        addr = self.places[idx].address or ""
+        ok = _copy_to_clipboard(addr)
+        self.status.set("Address copied to clipboard." if ok else "Copy failed (no clipboard tool found).")
+
+    def action_yank_rich(self) -> None:
+        idx = self._current_row()
+        if not self.places: return
+        p = self.places[idx]
+        line = f"{p.name} • {p.address} • {p.lat:.6f},{p.lon:.6f}"
+        ok = _copy_to_clipboard(line)
+        self.status.set("Name+Address+Coords copied." if ok else "Copy failed (no clipboard tool found).")
 
     # buttons
     def on_button_pressed(self, event: Button.Pressed):
@@ -411,7 +460,7 @@ class PlacesTUI(App):
                 pass
 
         if not cancel_evt.is_set():
-            self.call_from_thread(self.status.set, f"Done. Found {len(self.places)} place(s). Press 'o' to open.")
+            self.call_from_thread(self.status.set, f"Done. Found {len(self.places)} place(s). Press 'o' to open.  Press 'y' to copy address.")
 
     # ---------------- Cache warmer ----------------
     def _warm_cache(self):
@@ -434,7 +483,6 @@ class PlacesTUI(App):
                                f'node(around:{R},{lat},{lon})["brand"~{rx}];']
                 ql = f"[out:json][timeout:12];(" + "".join(blocks) + ");out center tags 80;"
                 key = "ovp:" + str(hash(ql))
-                # Warm via SWR fetcher (force a network fetch if missing/old)
                 _ = swr_json(
                     key=key,
                     soft_ttl_s=OVERPASS_SOFT_S,
